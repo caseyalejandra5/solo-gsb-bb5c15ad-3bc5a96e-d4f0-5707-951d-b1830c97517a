@@ -13,9 +13,23 @@ from .rfc1982 import MAX_SERIAL, SERIAL_HALF, forward_distance
 #: 当日编号 nn 的最大值（YYYYMMDDnn 共 100 个可用编号）
 NN_MAX = 99
 
+# SuggestionError.code 取值（用于 409 响应中的 reason 字段）
+ERR_OUT_OF_RANGE = "date_out_of_range"          # 日期超出 32 位表达范围
+ERR_HALF_INTERVAL = "half_interval_ambiguous"   # 与当日基准相距恰好 2^31
+ERR_AHEAD_OF_TODAY = "ahead_of_today"           # 已领先于当日可用编号区间
+ERR_NN_EXHAUSTED = "nn_exhausted"               # 当日编号 00-99 已耗尽
+
 
 class SuggestionError(Exception):
-    """无法给出有效建议（对应 HTTP 409 Conflict）。"""
+    """无法给出有效建议（对应 HTTP 409 Conflict）。
+
+    :param code: 机器可读的原因代码，便于调用方区分冲突类型；
+                 兼容仅有文本的旧式构造（code 缺省为 "unavailable"）。
+    """
+
+    def __init__(self, message: str, code: str = "unavailable") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def daily_base(today: date) -> int:
@@ -34,12 +48,15 @@ def suggest_next_serial(current: int, today: date) -> int:
     """
     base = daily_base(today)
     if base + NN_MAX > MAX_SERIAL:
-        raise SuggestionError("当前日期超出 32 位序列号可表达范围")
+        raise SuggestionError(
+            "当前日期超出 32 位序列号可表达范围", code=ERR_OUT_OF_RANGE
+        )
 
     delta = forward_distance(current, base)
     if delta == SERIAL_HALF:
         raise SuggestionError(
-            "当前序列号与今日基准的距离恰好为 2^31，RFC 1982 下不可比较，拒绝给出建议"
+            "当前序列号与今日基准的距离恰好为 2^31，RFC 1982 下不可比较，拒绝给出建议",
+            code=ERR_HALF_INTERVAL,
         )
     if delta == 0:
         # current == YYYYMMDD00
@@ -52,8 +69,11 @@ def suggest_next_serial(current: int, today: date) -> int:
     ahead = forward_distance(base, current)
     if ahead > NN_MAX:
         raise SuggestionError(
-            "当前序列号已领先于今日可用编号区间，无法给出 YYYYMMDDnn 形式的建议"
+            "当前序列号已领先于今日可用编号区间，无法给出 YYYYMMDDnn 形式的建议",
+            code=ERR_AHEAD_OF_TODAY,
         )
     if ahead == NN_MAX:
-        raise SuggestionError("当日编号 nn 已耗尽（00-99），请等待下一日期")
+        raise SuggestionError(
+            "当日编号 nn 已耗尽（00-99），请等待下一日期", code=ERR_NN_EXHAUSTED
+        )
     return current + 1

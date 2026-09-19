@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
 from .rfc1982 import MAX_SERIAL
@@ -14,10 +14,21 @@ from .schemas import (
     AuditOut,
     NextSerialOut,
     RepairPlanOut,
+    SerialReservationCreate,
+    SerialReservationOut,
+    validate_zone,
 )
 from .repair import build_repair_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
+
+
+def _normalize_zone(zone: str) -> str:
+    """校验路径中的区域名，非法时返回 400（路径参数不适用 422 语义）。"""
+    try:
+        return validate_zone(zone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="非法的 DNS 区域名") from exc
 
 
 @asynccontextmanager
@@ -118,6 +129,65 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "date": effective_today.strftime("%Y%m%d"),
             "note": "建议值相对当前值为 RFC 1982 意义下的有效前进",
         }
+
+    @app.post(
+        "/api/zones/{zone}/serial-reservations",
+        response_model=SerialReservationOut,
+        status_code=201,
+        responses={
+            200: {"model": SerialReservationOut, "description": "幂等重试，返回首次预留结果"},
+            409: {"description": "current 与服务端最新预留不一致，或编号耗尽/半区间歧义"},
+        },
+    )
+    def reserve_serial(zone: str, payload: SerialReservationCreate, response: Response) -> dict:
+        """原子预留下一个 YYYYMMDDnn serial 并持久化。
+
+        - 同一区域内相同 ``request_id`` 重试返回首次结果（200），不再次推进；
+        - ``current`` 与服务端已预留的最新值不一致时返回 409，
+          响应体 ``latest_serial`` 给出最新值；
+        - 当日编号耗尽 / 半区间歧义等同样返回 409。
+        """
+        zone_name = _normalize_zone(zone)
+        try:
+            record, replayed = db.reserve_serial(
+                app.state.db_path,
+                zone_name,
+                payload.request_id,
+                payload.current,
+            )
+        except db.ReservationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "latest_serial": exc.latest_serial,
+                },
+            ) from exc
+        except SuggestionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": exc.code, "message": str(exc), "latest_serial": None},
+            ) from exc
+        record["replayed"] = replayed
+        if replayed:
+            response.status_code = 200
+        return record
+
+    @app.get(
+        "/api/zones/{zone}/serial-reservations",
+        response_model=list[SerialReservationOut],
+    )
+    def list_serial_reservations(
+        zone: str,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> list[dict]:
+        """按区域查询预留记录（按预留先后升序）。"""
+        zone_name = _normalize_zone(zone)
+        return db.list_serial_reservations(
+            app.state.db_path, zone_name, limit=limit, offset=offset
+        )
 
     return app
 

@@ -1,16 +1,25 @@
 """API 与 RFC 1982 算术的测试。"""
 from __future__ import annotations
 
+import sqlite3
+import threading
+from datetime import date, datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db
 from app.main import create_app
-from app.rfc1982 import SERIAL_HALF, MAX_SERIAL, classify
-from app.suggest import suggest_next_serial, SuggestionError
-from datetime import date
+from app.rfc1982 import SERIAL_HALF, MAX_SERIAL, SERIAL_SPACE, classify
+from app.suggest import daily_base, suggest_next_serial, SuggestionError
 
 TODAY = date(2026, 9, 18)
 BASE = 2026091800  # YYYYMMDD00
+
+
+def _utc_today_base() -> int:
+    """服务器 UTC 当日的 YYYYMMDD00。"""
+    return daily_base(datetime.now(timezone.utc).date())
 
 
 @pytest.fixture()
@@ -285,3 +294,290 @@ def test_next_serial_default_date(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# ---------- SOA serial 持久化预留 ----------
+
+
+def test_reserve_first_and_next(client):
+    base = _utc_today_base()
+    resp = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": base - 1, "request_id": "req-1"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["serial"] == base  # 落后当日基准 → 分配 YYYYMMDD00
+    assert body["current"] == base - 1
+    assert body["zone"] == "example.com"
+    assert body["request_id"] == "req-1"
+    assert body["replayed"] is False
+    assert body["date"] == datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    # 第二次必须以上一次分配值为 current
+    resp2 = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": body["serial"], "request_id": "req-2"},
+    )
+    assert resp2.status_code == 201
+    assert resp2.json()["serial"] == base + 1
+
+
+def test_reserve_idempotent_replay_returns_first_result(client):
+    base = _utc_today_base()
+    payload = {"current": base, "request_id": "dup-req"}
+    first = client.post("/api/zones/example.com/serial-reservations", json=payload)
+    assert first.status_code == 201
+    assert first.json()["replayed"] is False
+
+    # 同 zone + 同 request_id 重试：200 + 首次结果，不再次推进
+    replay = client.post("/api/zones/example.com/serial-reservations", json=payload)
+    assert replay.status_code == 200
+    replay_body = replay.json()
+    assert replay_body == {**first.json(), "replayed": True}
+
+    # 即使重试时携带不同 current，仍返回首次结果
+    replay2 = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": base + 99, "request_id": "dup-req"},
+    )
+    assert replay2.status_code == 200
+    assert replay2.json()["serial"] == first.json()["serial"]
+    assert replay2.json()["current"] == base
+
+    # 预留记录只有一条
+    rows = client.get("/api/zones/example.com/serial-reservations").json()
+    assert [r["serial"] for r in rows] == [first.json()["serial"]]
+
+
+def test_reserve_stale_current_409_with_latest(client):
+    base = _utc_today_base()
+    first = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": base, "request_id": "a"},
+    ).json()
+    latest = first["serial"]
+
+    # 用过期 current 请求（新 request_id）→ 409 并带回最新值
+    resp = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": base, "request_id": "b"},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "stale_current"
+    assert detail["latest_serial"] == latest
+
+    # 按最新值重试可成功
+    ok = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": latest, "request_id": "b"},
+    )
+    assert ok.status_code == 201
+    assert ok.json()["serial"] == latest + 1
+
+
+def test_reserve_nn_exhausted_409(client):
+    base = _utc_today_base()
+    resp = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": base + 99, "request_id": "exhaust"},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "nn_exhausted"
+    assert detail["latest_serial"] is None
+
+
+def test_reserve_half_interval_409(client):
+    base = _utc_today_base()
+    ambiguous = (base + SERIAL_HALF) % SERIAL_SPACE
+    resp = client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": ambiguous, "request_id": "amb"},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "half_interval_ambiguous"
+
+
+def test_reserve_zones_are_independent(client):
+    base = _utc_today_base()
+    r1 = client.post(
+        "/api/zones/a.example/serial-reservations",
+        json={"current": base, "request_id": "x"},
+    )
+    r2 = client.post(
+        "/api/zones/b.example/serial-reservations",
+        json={"current": base, "request_id": "x"},
+    )
+    assert r1.status_code == r2.status_code == 201
+    # 不同区域互不影响 current 校验，且同一 request_id 可各自使用
+    assert r1.json()["serial"] == r2.json()["serial"] == base + 1
+
+    rows = client.get("/api/zones/a.example/serial-reservations").json()
+    assert [r["zone"] for r in rows] == ["a.example"]
+
+
+def test_reserve_list_order_and_pagination(client):
+    base = _utc_today_base()
+    current = base
+    for i in range(3):
+        body = client.post(
+            "/api/zones/example.com/serial-reservations",
+            json={"current": current, "request_id": f"r{i}"},
+        ).json()
+        current = body["serial"]
+
+    rows = client.get("/api/zones/example.com/serial-reservations").json()
+    assert [r["serial"] for r in rows] == [base + 1, base + 2, base + 3]
+    page = client.get(
+        "/api/zones/example.com/serial-reservations", params={"limit": 2, "offset": 1}
+    ).json()
+    assert [r["serial"] for r in page] == [base + 2, base + 3]
+    # 未知区域返回空列表
+    assert client.get("/api/zones/nonexistent.example/serial-reservations").json() == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"request_id": "r1"},                          # 缺 current
+        {"current": MAX_SERIAL + 1, "request_id": "r1"},  # current 越界
+        {"current": BASE, "request_id": 21},           # request_id 类型错误
+    ],
+)
+def test_reserve_invalid_body_422(client, payload):
+    resp = client.post(
+        "/api/zones/example.com/serial-reservations", json=payload
+    )
+    assert resp.status_code == 422
+
+
+def test_reserve_validation_errors(client):
+    # current 越界
+    assert client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": -1, "request_id": "r"},
+    ).status_code == 422
+    assert client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": MAX_SERIAL + 1, "request_id": "r"},
+    ).status_code == 422
+    # request_id 缺失 / 空白
+    assert client.post(
+        "/api/zones/example.com/serial-reservations", json={"current": BASE}
+    ).status_code == 422
+    assert client.post(
+        "/api/zones/example.com/serial-reservations",
+        json={"current": BASE, "request_id": "   "},
+    ).status_code == 422
+    # 路径中区域名非法
+    assert client.post(
+        "/api/zones/bad_zone!/serial-reservations",
+        json={"current": BASE, "request_id": "r"},
+    ).status_code == 400
+
+
+def test_reserve_persisted_across_app_instances(tmp_path):
+    db_path = str(tmp_path / "persist.db")
+    base = _utc_today_base()
+    with TestClient(create_app(db_path=db_path)) as c:
+        body = c.post(
+            "/api/zones/example.com/serial-reservations",
+            json={"current": base, "request_id": "persist-1"},
+        ).json()
+        assert body["serial"] == base + 1
+
+    # 重新打开同一数据库：记录仍在，且 current 校验以已预留最新值为准
+    with TestClient(create_app(db_path=db_path)) as c:
+        rows = c.get("/api/zones/example.com/serial-reservations").json()
+        assert [r["serial"] for r in rows] == [base + 1]
+        stale = c.post(
+            "/api/zones/example.com/serial-reservations",
+            json={"current": base, "request_id": "persist-2"},
+        )
+        assert stale.status_code == 409
+        replay = c.post(
+            "/api/zones/example.com/serial-reservations",
+            json={"current": base, "request_id": "persist-1"},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["serial"] == base + 1
+
+
+# ---------- 并发：串行化分配，不重复 serial ----------
+
+
+def test_concurrent_reservations_no_duplicate_serials(tmp_path):
+    db_path = str(tmp_path / "concurrent.db")
+    db.init_db(db_path)
+    base = _utc_today_base()
+    workers = 8
+    attempts = 5  # 8*5 = 40，不超过当日 99 个可用编号
+
+    allocated: list[int] = []
+    lock = threading.Lock()
+
+    def worker(worker_id: int) -> None:
+        current = base
+        for attempt in range(attempts):
+            request_id = f"w{worker_id}-a{attempt}"
+            for _ in range(60):  # 409 时按 latest_serial 追赶重试
+                try:
+                    record, replayed = db.reserve_serial(
+                        db_path, "example.com", request_id, current
+                    )
+                    break
+                except db.ReservationError as exc:
+                    if exc.code == db.ERR_STALE_CURRENT and exc.latest_serial is not None:
+                        current = exc.latest_serial
+                        continue
+                    raise
+                except sqlite3.OperationalError:
+                    continue
+            else:
+                raise AssertionError("并发预留多次重试后仍失败")
+            assert not replayed
+            with lock:
+                allocated.append(record["serial"])
+            current = record["serial"]
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(allocated) == workers * attempts
+    assert len(set(allocated)) == len(allocated)  # 无重复
+    assert set(allocated) == {base + i for i in range(1, workers * attempts + 1)}
+
+
+def test_concurrent_same_request_id_races_to_one_reservation(tmp_path):
+    db_path = str(tmp_path / "concurrent-idem.db")
+    with TestClient(create_app(db_path=db_path)) as c:
+        base = _utc_today_base()
+        results: list[tuple[int, int]] = []
+        barrier = threading.Barrier(8)
+
+        def hit() -> None:
+            barrier.wait()
+            resp = c.post(
+                "/api/zones/example.com/serial-reservations",
+                json={"current": base, "request_id": "same-req"},
+            )
+            results.append((resp.status_code, resp.json()["serial"]))
+
+        threads = [threading.Thread(target=hit) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 8
+        assert {status for status, _ in results} == {200, 201}
+        assert sum(1 for status, _ in results if status == 201) == 1
+        assert sum(1 for status, _ in results if status == 200) == 7
+        assert {serial for _, serial in results} == {base + 1}
+        rows = c.get("/api/zones/example.com/serial-reservations").json()
+        assert len(rows) == 1

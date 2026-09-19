@@ -15,6 +15,14 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _ZONE_RE = re.compile(rf"^(?:{_LABEL}\.)+{_LABEL}?\.?$|^{_LABEL}\.?$")
 
 
+def validate_zone(value: str) -> str:
+    """去除首尾空白并校验 DNS 区域名，非法时抛 ValueError。"""
+    zone = value.strip()
+    if not zone or not _ZONE_RE.match(zone):
+        raise ValueError("非法的 DNS 区域名")
+    return zone
+
+
 class AuditCreate(BaseModel):
     """提交一次审计：区域名 + 按观测时间升序排列的序列号列表。"""
 
@@ -29,10 +37,7 @@ class AuditCreate(BaseModel):
     @field_validator("zone")
     @classmethod
     def _check_zone(cls, value: str) -> str:
-        zone = value.strip()
-        if not _ZONE_RE.match(zone):
-            raise ValueError("非法的 DNS 区域名")
-        return zone
+        return validate_zone(value)
 
 
 class AuditItem(BaseModel):
@@ -104,3 +109,38 @@ class NextSerialOut(BaseModel):
     next: int
     date: str = Field(description="建议所基于的日期（UTC，YYYYMMDD）")
     note: str
+
+
+class SerialReservationCreate(BaseModel):
+    """序列号预留请求：当前 serial + 幂等键。"""
+
+    current: Serial = Field(
+        description="调用方已持有的最新 serial（区域首次预留时为其当前发布值）"
+    )
+    request_id: str = Field(
+        min_length=1,
+        max_length=255,
+        description="幂等键：同一区域内相同 request_id 的重试返回首次预留结果",
+        examples=["deploy-20260919-001"],
+    )
+
+    @field_validator("request_id")
+    @classmethod
+    def _check_request_id(cls, value: str) -> str:
+        request_id = value.strip()
+        if not request_id:
+            raise ValueError("request_id 不能为空")
+        return request_id
+
+
+class SerialReservationOut(BaseModel):
+    id: int
+    zone: str
+    request_id: str
+    current: int = Field(description="首次请求提交的 current 值")
+    serial: int = Field(description="服务端原子分配并持久化的下一 serial")
+    date: str = Field(description="分配所基于的日期（UTC，YYYYMMDD）")
+    created_at: str
+    replayed: bool = Field(
+        default=False, description="true 表示本次为幂等重试，返回的是首次预留结果"
+    )
