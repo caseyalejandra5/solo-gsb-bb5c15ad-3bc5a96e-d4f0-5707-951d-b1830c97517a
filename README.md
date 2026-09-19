@@ -5,6 +5,7 @@
 - 客户端提交区域名与**按观测时间排列**的 32 位 serial 列表；
 - 服务端按 **RFC 1982** 模运算逐项判定 `advance`（前进）/ `regression`（倒退）/ `equal`（相等）/ `incomparable`（不可比较），并标出**可能使从服务器拒绝更新的节点**（`slave_reject_risk`）；
 - 提供 **YYYYMMDDnn** 风格的下一序列号建议，保证相对当前值为有效前进；当日编号耗尽或存在半区间歧义时返回 **409**；
+- 支持 **SOA 序列号持久化预留**：在 SQLite 事务内按 YYYYMMDDnn / RFC 1982 规则为区域原子分配下一值——并发请求不会分配到重复 serial；同一区域同一 `request_id` 重试返回首次结果且不再次推进；`current` 与服务端已预留的最新值不一致时返回 **409** 并给出最新值；预留记录可按区域查询；
 - 审计记录持久化于 SQLite，可按 ID 查询；
 - 支持基于已有审计**即时生成序列修复预演**（不落库）：首个 serial 不变，其后各项与上一个修复后值按 RFC 1982 比较，非有效前进即替换为上一修复后值加 1（32 位无符号回绕）。
 
@@ -34,6 +35,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/audits/{id}/repair-plan` | 基于已有审计生成序列修复预演，不落库（不存在返回 404） |
 | `GET` | `/api/audits` | 审计记录列表（摘要，倒序） |
 | `GET` | `/api/next-serial?current=<serial>` | YYYYMMDDnn 下一序列号建议（歧义/耗尽返回 409） |
+| `POST` | `/api/zones/{zone}/serial-reservations` | 原子预留下一 SOA serial 并持久化（幂等；冲突/耗尽/歧义返回 409） |
+| `GET` | `/api/zones/{zone}/serial-reservations` | 按区域查询预留记录（按预留先后升序） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -105,6 +108,55 @@ curl -s 'http://localhost:8000/api/next-serial?current=2026091807'
 - `nn` 已达 `99`（当日编号耗尽）、当前值领先于当日区间、或与当日基准相距恰好 `2^31`（半区间歧义）时返回 **409**；
 - 可选参数 `today=YYYY-MM-DD` 指定建议所基于的日期（缺省为服务器 UTC 当日）。
 
+### SOA 序列号预留（原子 + 幂等）
+
+`POST /api/zones/{zone}/serial-reservations` 在 **SQLite 事务**（`BEGIN IMMEDIATE`）内完成「幂等检查 → 冲突检查 → 按 YYYYMMDDnn / RFC 1982 规则计算下一值 → 落库」的完整流程，配合 `(zone, request_id)`、`(zone, serial)` 唯一约束兜底：**并发请求不会分配到重复 serial**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/serial-reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"current": 2026091800, "request_id": "9f1c2a44-6d6b-4c7e-9f6f-2c0d1f2a7c01"}'
+```
+
+```json
+{
+  "id": 1,
+  "zone": "example.com",
+  "request_id": "9f1c2a44-6d6b-4c7e-9f6f-2c0d1f2a7c01",
+  "current": 2026091800,
+  "serial": 2026091801,
+  "date": "20260918",
+  "created_at": "2026-09-19T08:00:00.000000Z"
+}
+```
+
+语义说明：
+
+- **首次申请**：以 `current` 为基准分配下一值并落库（规则与 `/api/next-serial` 一致）；此后该区域的申请必须以服务端已预留的最新值作为 `current`；
+- **幂等重试**：同一区域同一 `request_id` 的重试返回首次结果原文（HTTP 201，响应头 `Idempotent-Replay: true`），**不再次推进**序列号；
+- **冲突**：`current` 与服务端已预留的最新值不一致时返回 **409** 并给出最新值，调用方修正后可重新申请：
+
+  ```json
+  {"detail": {"message": "current 与服务端已预留的最新值 2026091801 不一致", "latest_serial": 2026091801}}
+  ```
+- **耗尽 / 歧义**：当日编号耗尽或半区间歧义时沿用 **409**（响应体为 `{"detail": "..."}`，与 `/api/next-serial` 相同）；
+- 可选字段 `today`（`YYYY-MM-DD`）指定预留所基于的日期，缺省为服务器 UTC 当日。
+
+按区域查询预留记录（按预留先后升序，支持 `limit`/`offset`）：
+
+```bash
+curl -s http://localhost:8000/api/zones/example.com/serial-reservations
+```
+
+```json
+[
+  {"id": 1, "zone": "example.com", "request_id": "9f1c2a44-...", "current": 2026091800, "serial": 2026091801, "date": "20260918", "created_at": "2026-09-19T08:00:00.000000Z"},
+  {"id": 2, "zone": "example.com", "request_id": "b7e03d15-...", "current": 2026091801, "serial": 2026091802, "date": "20260918", "created_at": "2026-09-19T08:01:00.000000Z"}
+]
+```
+
+预留记录与审计记录存放在同一 SQLite 数据库中，随命名卷 `dns-audit-data` 一并持久化，`docker compose up --build` 一键启动即可使用，无需额外初始化。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -140,7 +192,7 @@ app/
   suggest.py   # YYYYMMDDnn 下一序列号建议
   repair.py    # 序列修复预演（不落库）
   service.py   # 逐项判定与汇总
-  db.py        # SQLite 持久层
+  db.py        # SQLite 持久层（审计 + 序列号预留，含事务化原子分配）
   schemas.py   # 请求/响应模型与校验
 tests/
   test_api.py  # API 与算术测试

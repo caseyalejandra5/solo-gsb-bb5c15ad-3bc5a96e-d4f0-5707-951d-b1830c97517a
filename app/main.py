@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
 from .rfc1982 import MAX_SERIAL
@@ -14,6 +14,9 @@ from .schemas import (
     AuditOut,
     NextSerialOut,
     RepairPlanOut,
+    SerialReservationCreate,
+    SerialReservationOut,
+    ZoneName,
 )
 from .repair import build_repair_plan
 from .service import analyze
@@ -33,9 +36,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description=(
             "提交区域名与按观测时间排列的 SOA serial，按 RFC 1982 模运算"
             "逐项判定前进/倒退/相等/不可比较，标出可能使从服务器拒绝更新的"
-            "节点，并提供 YYYYMMDDnn 风格的下一序列号建议。"
+            "节点，并提供 YYYYMMDDnn 风格的下一序列号建议；支持在 SQLite "
+            "事务中按区域原子预留序列号（幂等、并发安全）并持久化查询。"
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
     app.state.db_path = db_path or db.default_db_path()
@@ -118,6 +122,59 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "date": effective_today.strftime("%Y%m%d"),
             "note": "建议值相对当前值为 RFC 1982 意义下的有效前进",
         }
+
+    @app.post(
+        "/api/zones/{zone}/serial-reservations",
+        response_model=SerialReservationOut,
+        status_code=201,
+    )
+    def create_serial_reservation(
+        zone: ZoneName, payload: SerialReservationCreate, response: Response
+    ) -> dict:
+        """在 SQLite 事务中为区域原子预留下一个 SOA serial（幂等）。
+
+        - 并发请求在事务内串行化，不会分配到重复 serial；
+        - 同一区域同一 request_id 重试返回首次结果（响应头
+          `Idempotent-Replay: true`），不再次推进；
+        - current 与服务端已预留的最新值不一致时返回 409 并给出最新值；
+        - 当日编号耗尽或半区间歧义时沿用 409。
+        """
+        effective_today = payload.today or datetime.now(timezone.utc).date()
+        try:
+            record, replayed = db.reserve_serial(
+                app.state.db_path,
+                zone,
+                payload.request_id,
+                payload.current,
+                effective_today,
+            )
+        except db.ReservationConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "latest_serial": exc.latest_serial,
+                },
+            ) from exc
+        except SuggestionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+        return record
+
+    @app.get(
+        "/api/zones/{zone}/serial-reservations",
+        response_model=list[SerialReservationOut],
+    )
+    def list_serial_reservations(
+        zone: ZoneName,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> list[dict]:
+        """按区域查询预留记录（按预留先后升序）。"""
+        return db.list_serial_reservations(
+            app.state.db_path, zone, limit=limit, offset=offset
+        )
 
     return app
 
